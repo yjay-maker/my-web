@@ -10,6 +10,15 @@ type Learner = {
   created_at: string;
 };
 
+type WordRow = {
+  id: string;
+  word: string;
+  meaning_ko: string;
+  grade_level: number;
+  image_url: string | null;
+  audio_url: string | null;
+};
+
 function makeJoinCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let out = "";
@@ -19,11 +28,21 @@ function makeJoinCode() {
 }
 
 export default function Home() {
+  // =========================
+  // A) 학습자(learner) 영역
+  // =========================
   const [nickname, setNickname] = useState("");
   const [joinCodeInput, setJoinCodeInput] = useState("");
   const [currentLearner, setCurrentLearner] = useState<Learner | null>(null);
   const [status, setStatus] = useState<string>("");
 
+  // =========================
+  // B) 단어(words) 영역
+  // =========================
+  const [words, setWords] = useState<WordRow[]>([]);
+  const [wordsStatus, setWordsStatus] = useState<string>("");
+
+  // (선택) 이 기기에서 마지막 선택 학습자 자동 불러오기
   useEffect(() => {
     const savedId = localStorage.getItem("learner_id");
     if (!savedId) return;
@@ -35,16 +54,38 @@ export default function Home() {
         .eq("id", savedId)
         .single();
 
-      if (error) {
-        setStatus(`(자동 불러오기 실패) ${error.message}`);
-        return;
-      }
-
+      if (error) return;
       setCurrentLearner(data as Learner);
       setStatus("이 기기에서 마지막 학습자를 자동으로 불러왔어.");
     };
 
     load();
+  }, []);
+
+  // ✅ 단어 10개 불러오기 (페이지 열릴 때 1회)
+  useEffect(() => {
+    const loadWords = async () => {
+      setWordsStatus("단어 불러오는 중...");
+
+      // grade_level = 3 인 단어 중 10개 가져오기
+      // (처음에는 단순히 created_at 기준으로 10개 가져오고,
+      //  나중에 랜덤/세션 구성으로 바꿀 거야)
+      const { data, error } = await supabase
+        .from("words")
+        .select("id, word, meaning_ko, grade_level, image_url, audio_url")
+        .eq("grade_level", 3)
+        .limit(10);
+
+      if (error) {
+        setWordsStatus(`단어 로드 실패: ${error.message}`);
+        return;
+      }
+
+      setWords(data as WordRow[]);
+      setWordsStatus(`단어 ${data?.length ?? 0}개 로드 완료`);
+    };
+
+    loadWords();
   }, []);
 
   const createLearner = async () => {
@@ -119,17 +160,17 @@ export default function Home() {
   };
 
   return (
-    <main className="p-8 max-w-xl space-y-6">
-      <h1 className="text-2xl font-bold">학습자 테스트 (Supabase)</h1>
+    <main className="p-8 max-w-2xl space-y-6">
+      <h1 className="text-2xl font-bold">영어 단어 학습 (Supabase)</h1>
 
-      {/* ✅ 상태 메시지를 상단에 고정 노출 */}
+      {/* 상태 메시지 */}
       {status && (
         <div className="rounded-md border bg-yellow-50 p-3 text-sm">
           상태: {status}
         </div>
       )}
 
-      {/* ✅ 성공하면 바로 눈에 띄게 */}
+      {/* 현재 학습자 */}
       <div className="rounded-md border p-4">
         <h2 className="font-semibold mb-2">현재 선택된 학습자</h2>
         {currentLearner ? (
@@ -156,40 +197,66 @@ export default function Home() {
         )}
       </div>
 
-      <div className="rounded-md border p-4">
-        <h2 className="font-semibold mb-2">1) 학습자 만들기</h2>
-        <div className="flex gap-2">
-          <input
-            value={nickname}
-            onChange={(e) => setNickname(e.target.value)}
-            placeholder="닉네임 (예: 민준)"
-            className="w-full rounded-md border px-3 py-2"
-          />
-          <button
-            onClick={createLearner}
-            className="rounded-md bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
-          >
-            생성
-          </button>
+      {/* 학습자 만들기 / 불러오기 */}
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="rounded-md border p-4">
+          <h2 className="font-semibold mb-2">1) 학습자 만들기</h2>
+          <div className="flex gap-2">
+            <input
+              value={nickname}
+              onChange={(e) => setNickname(e.target.value)}
+              placeholder="닉네임 (예: 민준)"
+              className="w-full rounded-md border px-3 py-2"
+            />
+            <button
+              onClick={createLearner}
+              className="rounded-md bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+            >
+              생성
+            </button>
+          </div>
+        </div>
+
+        <div className="rounded-md border p-4">
+          <h2 className="font-semibold mb-2">2) 코드로 불러오기</h2>
+          <div className="flex gap-2">
+            <input
+              value={joinCodeInput}
+              onChange={(e) => setJoinCodeInput(e.target.value)}
+              placeholder="6자리 코드 (예: A3K9ZQ)"
+              className="w-full rounded-md border px-3 py-2"
+            />
+            <button
+              onClick={findLearnerByCode}
+              className="rounded-md bg-gray-800 px-4 py-2 text-white hover:bg-gray-900"
+            >
+              불러오기
+            </button>
+          </div>
         </div>
       </div>
 
+      {/* ✅ 단어 10개 영역 */}
       <div className="rounded-md border p-4">
-        <h2 className="font-semibold mb-2">2) 코드로 학습자 불러오기</h2>
-        <div className="flex gap-2">
-          <input
-            value={joinCodeInput}
-            onChange={(e) => setJoinCodeInput(e.target.value)}
-            placeholder="6자리 코드 (예: A3K9ZQ)"
-            className="w-full rounded-md border px-3 py-2"
-          />
-          <button
-            onClick={findLearnerByCode}
-            className="rounded-md bg-gray-800 px-4 py-2 text-white hover:bg-gray-900"
-          >
-            불러오기
-          </button>
+        <div className="flex items-baseline justify-between">
+          <h2 className="font-semibold mb-2">오늘의 단어 10개</h2>
+          <p className="text-xs text-gray-600">{wordsStatus}</p>
         </div>
+
+        {words.length === 0 ? (
+          <p className="text-gray-600">
+            단어가 아직 안 보여. (잠시만 기다리거나 상태 메시지를 확인해줘)
+          </p>
+        ) : (
+          <ul className="grid gap-3 md:grid-cols-2">
+            {words.map((w) => (
+              <li key={w.id} className="rounded-md border p-3">
+                <div className="text-lg font-bold">{w.word}</div>
+                <div className="text-gray-700">{w.meaning_ko}</div>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </main>
   );
