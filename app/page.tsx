@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 
 type Learner = {
@@ -42,16 +42,6 @@ function makeJoinCode() {
   return out;
 }
 
-function speak(text: string) {
-  if (typeof window === "undefined") return;
-
-  window.speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = "en-US";
-  u.rate = 0.95;
-  window.speechSynthesis.speak(u);
-}
-
 function shuffle<T>(arr: T[]) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -63,11 +53,9 @@ function shuffle<T>(arr: T[]) {
 
 function buildQuiz(words: WordRow[]): QuizQuestion[] {
   const pool = words.map((w) => w.word);
-
   return words.map((w) => {
     const wrong = shuffle(pool.filter((x) => x !== w.word)).slice(0, 3);
     const choices = shuffle([w.word, ...wrong]);
-
     return {
       id: w.id,
       prompt: w.meaning_ko || "(뜻 없음)",
@@ -75,6 +63,10 @@ function buildQuiz(words: WordRow[]): QuizQuestion[] {
       choices,
     };
   });
+}
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 export default function Home() {
@@ -87,21 +79,29 @@ export default function Home() {
 
   const [createOpen, setCreateOpen] = useState(false);
   const [createNickname, setCreateNickname] = useState("");
-
   const [deleteTarget, setDeleteTarget] = useState<Learner | null>(null);
 
-  // B) 단어 + 발음
+  // B) 단어
   const [words, setWords] = useState<WordRow[]>([]);
   const [wordsStatus, setWordsStatus] = useState<string>("");
 
-  const [repeatOn, setRepeatOn] = useState(false);
-  const [repeatIndex, setRepeatIndex] = useState<number>(0);
+  // ✅ 반복 모드(설정) + 재생 상태(실행)
+  const [repeatOn, setRepeatOn] = useState(false); // 설정 스위치 (ON이어도 자동재생 X)
+  const [repeatMode, setRepeatMode] = useState<"none" | "word" | "all">("none");
+  const [repeatWordId, setRepeatWordId] = useState<string | null>(null);
+
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playingWordId, setPlayingWordId] = useState<string | null>(null);
 
   // C) 퀴즈
   const [view, setView] = useState<"learn" | "quiz" | "result">("learn");
   const [quiz, setQuiz] = useState<QuizQuestion[]>([]);
   const [qIndex, setQIndex] = useState(0);
-  const [picked, setPicked] = useState<string | null>(null);
+
+  // ✅ “선택(미제출)”과 “제출(채점)” 분리
+  const [selectedChoice, setSelectedChoice] = useState<string | null>(null);
+  const [submittedChoice, setSubmittedChoice] = useState<string | null>(null);
+
   const [correctCount, setCorrectCount] = useState(0);
   const [quizStatus, setQuizStatus] = useState("");
 
@@ -110,6 +110,46 @@ export default function Home() {
 
   const learnersEmpty = useMemo(() => learners.length === 0, [learners]);
   const selectedId = currentLearner?.id ?? null;
+
+  // --- TTS helpers (Promise 기반) ---
+  const speakOnce = (text: string) => {
+    if (typeof window === "undefined") return Promise.resolve();
+
+    return new Promise<void>((resolve) => {
+      try {
+        window.speechSynthesis.cancel();
+
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = "en-US";
+        u.rate = 0.95;
+
+        const done = () => resolve();
+        u.onend = done;
+        u.onerror = done;
+
+        window.speechSynthesis.speak(u);
+      } catch {
+        resolve();
+      }
+    });
+  };
+
+  const stopAudio = () => {
+    if (typeof window === "undefined") return;
+    window.speechSynthesis.cancel();
+    setIsPlaying(false);
+    setPlayingWordId(null);
+  };
+
+  // 반복 루프 제어용 토큰
+  const loopTokenRef = useRef(0);
+
+  const stopRepeat = () => {
+    loopTokenRef.current += 1; // 기존 루프 종료
+    stopAudio();
+    setRepeatMode("none");
+    setRepeatWordId(null);
+  };
 
   // learners 로드
   const loadLearners = async () => {
@@ -188,35 +228,85 @@ export default function Home() {
     loadWords();
   }, []);
 
-  // 반복 재생
+  // ✅ repeatOn이 OFF로 바뀌면 반복 재생도 같이 정지
   useEffect(() => {
-    if (!repeatOn) return;
-    if (words.length === 0) return;
+    if (!repeatOn) {
+      stopRepeat();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repeatOn]);
 
-    let cancelled = false;
+  // ✅ 반복 재생 루프: mode(word/all)일 때만 돌아감
+  useEffect(() => {
+    const run = async () => {
+      if (!repeatOn) return;
+      if (repeatMode === "none") return;
+      if (words.length === 0) return;
 
-    const playLoop = () => {
-      if (cancelled) return;
+      const token = ++loopTokenRef.current;
 
-      const w = words[repeatIndex % words.length];
-      speak(w.word);
+      // “단어 반복”
+      if (repeatMode === "word") {
+        const w = words.find((x) => x.id === repeatWordId);
+        if (!w) return;
 
-      const t = window.setTimeout(() => {
-        if (cancelled) return;
-        setRepeatIndex((prev) => (prev + 1) % words.length);
-      }, 2000);
+        while (
+          loopTokenRef.current === token &&
+          repeatOn &&
+          repeatMode === "word"
+        ) {
+          setIsPlaying(true);
+          setPlayingWordId(w.id);
 
-      return () => window.clearTimeout(t);
+          await speakOnce(w.word);
+          if (loopTokenRef.current !== token) break;
+
+          // 텀 (발음 끝난 뒤 잠깐 쉬기)
+          await wait(900);
+        }
+
+        if (loopTokenRef.current === token) {
+          setIsPlaying(false);
+          setPlayingWordId(null);
+        }
+        return;
+      }
+
+      // “전체 듣기 반복”
+      if (repeatMode === "all") {
+        let i = 0;
+
+        while (
+          loopTokenRef.current === token &&
+          repeatOn &&
+          repeatMode === "all"
+        ) {
+          const w = words[i % words.length];
+          setIsPlaying(true);
+          setPlayingWordId(w.id);
+
+          await speakOnce(w.word);
+          if (loopTokenRef.current !== token) break;
+
+          await wait(900);
+
+          i = (i + 1) % words.length;
+        }
+
+        if (loopTokenRef.current === token) {
+          setIsPlaying(false);
+          setPlayingWordId(null);
+        }
+      }
     };
 
-    const cleanup = playLoop();
+    run();
 
     return () => {
-      cancelled = true;
-      window.speechSynthesis.cancel();
-      if (typeof cleanup === "function") cleanup();
+      // effect가 다시 실행될 때 이전 루프는 token 변경으로 종료됨
     };
-  }, [repeatOn, repeatIndex, words]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repeatOn, repeatMode, repeatWordId, words]);
 
   // 학습자 선택
   const selectLearner = async (l: Learner) => {
@@ -232,7 +322,7 @@ export default function Home() {
     setStatus("현재 선택된 학습자를 해제했어.");
   };
 
-  // 학습자 생성 모달
+  // 학습자 생성
   const openCreate = () => {
     setCreateNickname("");
     setCreateOpen(true);
@@ -283,7 +373,7 @@ export default function Home() {
     setStatus("코드 생성이 여러 번 충돌했어. 다시 시도해줘.");
   };
 
-  // 삭제 확인 모달
+  // 삭제 확인
   const openDeleteConfirm = (l: Learner) => setDeleteTarget(l);
   const closeDeleteConfirm = () => setDeleteTarget(null);
 
@@ -311,7 +401,68 @@ export default function Home() {
     setStatus("삭제 완료");
   };
 
-  // 퀴즈
+  // ✅ 발음 버튼 클릭 동작(반복/단발 분기)
+  const onClickListenWord = async (w: WordRow) => {
+    if (!repeatOn) {
+      // 반복 OFF: 그냥 1번만 재생
+      stopRepeat();
+      setIsPlaying(true);
+      setPlayingWordId(w.id);
+      await speakOnce(w.word);
+      setIsPlaying(false);
+      setPlayingWordId(null);
+      return;
+    }
+
+    // 반복 ON: 해당 단어 반복 토글
+    const isSameWordRepeating = repeatMode === "word" && repeatWordId === w.id;
+    if (isSameWordRepeating) {
+      stopRepeat(); // 다시 누르면 멈춤
+      return;
+    }
+
+    // 다른 반복(전체/다른 단어) 중이면 끊고 이 단어로 전환
+    stopRepeat();
+    setRepeatWordId(w.id);
+    setRepeatMode("word");
+  };
+
+  // ✅ 전체 듣기 버튼
+  const onClickListenAll = async () => {
+    if (!repeatOn) {
+      // 반복 OFF: 전체를 1회만 순서대로 재생
+      stopRepeat();
+      if (words.length === 0) return;
+
+      loopTokenRef.current += 1;
+      const token = loopTokenRef.current;
+
+      setIsPlaying(true);
+      for (const w of words) {
+        if (loopTokenRef.current !== token) break;
+        setPlayingWordId(w.id);
+        await speakOnce(w.word);
+        await wait(900);
+      }
+
+      if (loopTokenRef.current === token) {
+        setIsPlaying(false);
+        setPlayingWordId(null);
+      }
+      return;
+    }
+
+    // 반복 ON: 전체 반복 토글
+    if (repeatMode === "all") {
+      stopRepeat();
+      return;
+    }
+
+    stopRepeat();
+    setRepeatMode("all");
+  };
+
+  // 퀴즈 시작
   const startQuiz = () => {
     if (!currentLearner) {
       setQuizStatus("먼저 학습자를 선택해줘.");
@@ -322,36 +473,53 @@ export default function Home() {
       return;
     }
 
-    setRepeatOn(false);
-    window.speechSynthesis.cancel();
+    // 퀴즈 시작 시 오디오 정리
+    stopRepeat();
 
     const q = buildQuiz(words);
     setQuiz(q);
     setQIndex(0);
-    setPicked(null);
+
+    setSelectedChoice(null);
+    setSubmittedChoice(null);
+
     setCorrectCount(0);
     setQuizStatus("");
     setView("quiz");
   };
 
   const currentQ = quiz[qIndex];
+  const totalQ = quiz.length;
 
-  const pickChoice = (choice: string) => {
+  const onSelectChoice = (c: string) => {
+    if (submittedChoice) return; // 이미 제출했으면 선택 변경 못하게(실수 방지)
+    setSelectedChoice(c);
+  };
+
+  const onSubmitChoice = () => {
     if (!currentQ) return;
-    if (picked) return;
+    if (!selectedChoice) return;
 
-    setPicked(choice);
-    const isCorrect = choice === currentQ.answer;
-    if (isCorrect) setCorrectCount((c) => c + 1);
+    setSubmittedChoice(selectedChoice);
 
-    window.setTimeout(() => {
-      if (qIndex + 1 >= quiz.length) {
-        setView("result");
-      } else {
-        setQIndex((i) => i + 1);
-        setPicked(null);
-      }
-    }, 800);
+    if (selectedChoice === currentQ.answer) {
+      setCorrectCount((v) => v + 1);
+    }
+  };
+
+  const onNextQuestion = () => {
+    if (!currentQ) return;
+
+    // 다음 문제로
+    const next = qIndex + 1;
+    if (next >= totalQ) {
+      setView("result");
+      return;
+    }
+
+    setQIndex(next);
+    setSelectedChoice(null);
+    setSubmittedChoice(null);
   };
 
   const saveResult = async () => {
@@ -359,12 +527,11 @@ export default function Home() {
 
     setQuizStatus("점수 저장 중...");
 
-    const total = quiz.length;
-    const score = correctCount;
-
-    const { error } = await supabase
-      .from("quiz_attempts")
-      .insert({ learner_id: currentLearner.id, score, total });
+    const { error } = await supabase.from("quiz_attempts").insert({
+      learner_id: currentLearner.id,
+      score: correctCount,
+      total: quiz.length,
+    });
 
     if (error) {
       setQuizStatus(`저장 실패: ${error.message}`);
@@ -379,10 +546,16 @@ export default function Home() {
     setView("learn");
     setQuiz([]);
     setQIndex(0);
-    setPicked(null);
+    setSelectedChoice(null);
+    setSubmittedChoice(null);
     setCorrectCount(0);
     setQuizStatus("");
   };
+
+  // 버튼 활성 색상 판단
+  const isWordRepeating = (id: string) =>
+    repeatOn && repeatMode === "word" && repeatWordId === id;
+  const isAllRepeating = repeatOn && repeatMode === "all";
 
   return (
     <main className="min-h-screen bg-pink-50 p-6 flex justify-center">
@@ -499,11 +672,9 @@ export default function Home() {
               <h2 className="font-bold text-pink-600">📚 오늘의 단어 10개</h2>
 
               <div className="flex items-center gap-2">
+                {/* 반복 스위치: ON이어도 자동재생 X */}
                 <button
-                  onClick={() => {
-                    setRepeatIndex(0);
-                    setRepeatOn((v) => !v);
-                  }}
+                  onClick={() => setRepeatOn((v) => !v)}
                   className={`rounded-full px-4 py-2 text-sm font-semibold transition active:scale-95 ${
                     repeatOn
                       ? "bg-pink-500 text-white shadow"
@@ -513,8 +684,36 @@ export default function Home() {
                   🔁 반복 {repeatOn ? "ON" : "OFF"}
                 </button>
 
+                {/* 전체 듣기 */}
+                <button
+                  onClick={onClickListenAll}
+                  className={`rounded-full px-4 py-2 text-sm font-semibold transition active:scale-95 ${
+                    isAllRepeating
+                      ? "bg-purple-500 text-white shadow"
+                      : "bg-white border border-pink-200 text-pink-600 hover:bg-pink-50"
+                  }`}
+                  title={
+                    repeatOn
+                      ? "반복 ON이면 전체 반복, OFF이면 1회 재생"
+                      : "전체 단어를 1번씩 재생"
+                  }
+                >
+                  🎧 전체 듣기
+                </button>
+
                 <p className="text-xs text-pink-400">{wordsStatus}</p>
               </div>
+            </div>
+
+            <div className="text-xs text-gray-500">
+              {repeatOn
+                ? "반복 ON: 단어의 ‘발음 듣기’를 누르면 그 단어가 반복돼요. 다시 누르면 멈춰요."
+                : "반복 OFF: 발음은 1번만 재생돼요. (반복하려면 반복 ON을 켜세요)"}
+              {isPlaying && playingWordId ? (
+                <span className="ml-2 text-pink-600 font-semibold">
+                  • 재생 중…
+                </span>
+              ) : null}
             </div>
 
             {words.length === 0 ? (
@@ -526,7 +725,11 @@ export default function Home() {
                 {words.map((w) => (
                   <li
                     key={w.id}
-                    className="rounded-2xl bg-pink-50 p-4 flex items-center justify-between gap-3 shadow-sm border border-pink-100"
+                    className={`rounded-2xl p-4 flex items-center justify-between gap-3 shadow-sm border transition ${
+                      playingWordId === w.id
+                        ? "bg-pink-100 border-pink-200"
+                        : "bg-pink-50 border-pink-100"
+                    }`}
                   >
                     <div>
                       <div className="text-xl font-extrabold text-pink-600">
@@ -538,8 +741,19 @@ export default function Home() {
                     </div>
 
                     <button
-                      onClick={() => speak(w.word)}
-                      className="rounded-full bg-white px-4 py-2 text-sm font-semibold text-pink-500 shadow hover:bg-pink-100 active:scale-95 transition"
+                      onClick={() => onClickListenWord(w)}
+                      className={`rounded-full px-4 py-2 text-sm font-semibold shadow active:scale-95 transition ${
+                        isWordRepeating(w.id)
+                          ? "bg-pink-500 text-white"
+                          : "bg-white text-pink-600 hover:bg-pink-100"
+                      }`}
+                      title={
+                        repeatOn
+                          ? isWordRepeating(w.id)
+                            ? "반복 중(다시 누르면 멈춤)"
+                            : "이 단어를 반복"
+                          : "발음을 1번 듣기"
+                      }
                     >
                       🔊 발음 듣기
                     </button>
@@ -585,7 +799,7 @@ export default function Home() {
 
             <div className="rounded-2xl bg-pink-50 p-5 border border-pink-100 space-y-2">
               <p className="text-sm text-pink-500 font-semibold">
-                뜻을 보고 영어 단어를 골라요!
+                뜻을 보고 영어 단어를 고르세요
               </p>
               <p className="text-3xl font-extrabold text-gray-800">
                 {currentQ.prompt}
@@ -594,27 +808,42 @@ export default function Home() {
 
             <div className="grid gap-3">
               {currentQ.choices.map((c) => {
-                const show = Boolean(picked);
-                const isPicked = picked === c;
+                const isSelected = selectedChoice === c;
+                const isSubmitted = submittedChoice !== null;
                 const isAnswer = c === currentQ.answer;
+                const isChosen = submittedChoice === c;
 
+                // 제출 전: 선택 강조만
+                // 제출 후: 정답 초록, 제출한 오답 빨강
                 let cls =
-                  "rounded-2xl border-2 p-4 text-lg font-semibold transition active:scale-[0.99]";
-                if (show && isAnswer)
-                  cls += " bg-green-400 text-white border-green-500";
-                else if (show && isPicked && !isAnswer)
-                  cls += " bg-red-400 text-white border-red-500";
-                else cls += " bg-white border-pink-200 hover:bg-pink-50";
+                  "rounded-2xl border-2 p-4 text-lg font-semibold transition active:scale-[0.99] text-left";
+
+                if (!isSubmitted) {
+                  cls += isSelected
+                    ? " bg-pink-200 border-pink-400"
+                    : " bg-white border-pink-200 hover:bg-pink-50";
+                } else {
+                  if (isAnswer)
+                    cls += " bg-green-400 text-white border-green-500";
+                  else if (isChosen && !isAnswer)
+                    cls += " bg-red-400 text-white border-red-500";
+                  else cls += " bg-white border-pink-200 opacity-80";
+                }
 
                 return (
-                  <button key={c} onClick={() => pickChoice(c)} className={cls}>
+                  <button
+                    key={c}
+                    onClick={() => onSelectChoice(c)}
+                    className={cls}
+                  >
                     {c}
                   </button>
                 );
               })}
             </div>
 
-            <div className="flex items-center justify-between pt-1">
+            {/* 제출/다음 */}
+            <div className="flex items-center justify-between pt-1 gap-2">
               <button
                 onClick={backToLearn}
                 className="rounded-full border border-pink-200 bg-white px-4 py-2 text-sm font-semibold text-pink-500 hover:bg-pink-50 active:scale-95 transition"
@@ -622,13 +851,39 @@ export default function Home() {
                 ← 학습으로
               </button>
 
-              <button
-                onClick={() => speak(currentQ.answer)}
-                className="rounded-full bg-white px-4 py-2 text-sm font-semibold text-pink-500 shadow hover:bg-pink-100 active:scale-95 transition"
-              >
-                🔊 정답 발음
-              </button>
+              <div className="flex items-center gap-2">
+                {!submittedChoice ? (
+                  <button
+                    onClick={onSubmitChoice}
+                    disabled={!selectedChoice}
+                    className="rounded-full bg-pink-500 px-5 py-2 text-white font-extrabold hover:bg-pink-600 active:scale-95 transition disabled:opacity-40"
+                  >
+                    ✅ 확인
+                  </button>
+                ) : (
+                  <button
+                    onClick={onNextQuestion}
+                    className="rounded-full bg-purple-500 px-5 py-2 text-white font-extrabold hover:bg-purple-600 active:scale-95 transition"
+                  >
+                    {qIndex + 1 >= quiz.length ? "🎉 결과 보기" : "➡️ 다음"}
+                  </button>
+                )}
+              </div>
             </div>
+
+            {/* 피드백 메시지 */}
+            {submittedChoice && (
+              <div className="rounded-2xl bg-white p-4 shadow-sm border border-pink-100 text-sm">
+                {submittedChoice === currentQ.answer ? (
+                  <span className="font-semibold text-green-600">정답! 🌟</span>
+                ) : (
+                  <span className="font-semibold text-red-600">
+                    아쉬워요! 정답은{" "}
+                    <span className="underline">{currentQ.answer}</span> 💡
+                  </span>
+                )}
+              </div>
+            )}
           </section>
         )}
 
